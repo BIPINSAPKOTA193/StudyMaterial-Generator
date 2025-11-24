@@ -234,7 +234,8 @@ def render_quiz_content(data: Dict[str, Any]):
                         source_reference=source_ref,
                         is_correct=is_correct,
                         question_text=q.get("question", ""),
-                        username=st.session_state.get("username")
+                        username=st.session_state.get("username"),
+                        filename=filename
                     )
                     st.session_state[tracking_key] = True
                 st.rerun()
@@ -499,7 +500,8 @@ def render_interactive_content(data: Dict[str, Any]):
                             source_reference=source_ref,
                             is_correct=is_correct,
                             question_text=f"Interactive Checkpoint: {step.get('checkpoint', '')[:50]}",
-                            username=st.session_state.get("username")
+                            username=st.session_state.get("username"),
+                            filename=filename
                         )
                         st.session_state[tracking_key] = True
                     
@@ -508,7 +510,7 @@ def render_interactive_content(data: Dict[str, Any]):
                         st.session_state.interactive_stars += 1
                     
                     st.rerun()
-            
+                
             # Show result after submission
             if is_submitted:
                 if is_correct:
@@ -595,16 +597,24 @@ def render_performance_heatmap(all_perf: Dict[str, Dict[str, Any]]):
     except ImportError:
         st.warning("Plotly not installed. Install with: pip install plotly")
         # Fallback to simple text display
+        # Import format_topic_name for user-friendly labels
+        from src.core.analytics import format_topic_name
+        
         st.write("**Performance by Area:**")
         for chunk_id, perf in sorted(all_perf.items()):
             if perf["attempts"] > 0:
                 accuracy_color = "🟢" if perf["accuracy"] >= 80 else "🟡" if perf["accuracy"] >= 60 else "🔴"
-                st.write(f"{accuracy_color} {perf.get('source_reference', chunk_id)[:50]}: {perf['accuracy']:.1f}% ({perf['attempts']} attempts)")
+                ref = perf.get("source_reference", chunk_id)
+                topic_name = format_topic_name(ref, max_length=50)
+                st.write(f"{accuracy_color} {topic_name}: {perf['accuracy']:.1f}% ({perf['attempts']} questions)")
         return
     
     if not all_perf:
         st.info("No performance data available yet.")
         return
+    
+    # Import format_topic_name for user-friendly labels
+    from src.core.analytics import format_topic_name
     
     # Prepare data for heatmap
     chunk_ids = []
@@ -617,9 +627,10 @@ def render_performance_heatmap(all_perf: Dict[str, Dict[str, Any]]):
             chunk_ids.append(chunk_id)
             accuracies.append(perf["accuracy"])
             attempts.append(perf["attempts"])
-            # Create label with chunk info
+            # Create user-friendly label using format_topic_name
             ref = perf.get("source_reference", chunk_id)
-            labels.append(f"{ref[:30]}...\n{perf['accuracy']:.0f}% ({perf['attempts']} attempts)")
+            topic_name = format_topic_name(ref, max_length=30)
+            labels.append(f"{topic_name}\n{perf['accuracy']:.0f}% ({perf['attempts']} questions)")
     
     if not chunk_ids:
         st.info("No performance data available yet.")
@@ -822,6 +833,11 @@ def main():
                         extracted_chunks = [chunk for chunk in extracted_chunks if chunk and chunk.strip()]
                         st.session_state.extracted_chunks = extracted_chunks
                         st.session_state.current_filename = uploaded_file.name  # Store filename
+                        
+                        # Register file for analytics (create file hash -> filename mapping)
+                        from src.core.analytics import register_file
+                        register_file(uploaded_file.name, username=st.session_state.get("username"))
+                        
                         st.success(f"✅ Extracted {len(st.session_state.extracted_chunks)} chunks from {uploaded_file.name}")
                         
                         if not st.session_state.extracted_chunks:
@@ -882,7 +898,9 @@ def main():
             get_performance_summary,
             get_weak_areas,
             get_strong_areas,
-            get_all_chunk_performance
+            get_all_chunk_performance,
+            format_topic_name,
+            group_chunks_by_file
         )
         
         # Ensure username is available (should always be set if authenticated)
@@ -940,46 +958,141 @@ def main():
             
             st.divider()
             
-            # Performance by Area
-            st.header("📊 Performance by Area")
+            # Performance by File
+            st.header("📊 Performance by File")
             if all_perf:
-                # Group by file if possible (chunk IDs with file hash prefix)
-                for chunk_id, perf in sorted(all_perf.items()):
-                    accuracy = perf.get("accuracy", 0.0)
-                    attempts = perf.get("attempts", 0)
-                    source_ref = perf.get("source_reference", chunk_id)
+                # Group chunks by file
+                files_data = group_chunks_by_file(all_perf, username=username)
+                
+                # Sort files by last attempt (most recent first) or by accuracy
+                sorted_files = sorted(
+                    files_data.items(),
+                    key=lambda x: (
+                        x[1].get("last_attempt") or "",
+                        -x[1].get("accuracy", 0)
+                    ),
+                    reverse=True
+                )
+                
+                for file_hash, file_data in sorted_files:
+                    file_accuracy = file_data.get("accuracy", 0.0)
+                    file_attempts = file_data.get("total_attempts", 0)
+                    chunks_count = len(file_data.get("chunks", {}))
+                    chunks_with_data = file_data.get("chunks_with_data", 0)
                     
-                    # Extract file info from chunk_id if it has file hash
-                    file_info = ""
-                    if "_chunk_" in chunk_id:
-                        # Try to show which file this came from
-                        file_hash = chunk_id.split("_chunk_")[0]
-                        file_info = f" [File: {file_hash[:8]}...]"
-                    
-                    # Color code based on performance
-                    if accuracy >= 80:
+                    # Color code based on file-level performance
+                    if file_accuracy >= 80:
                         emoji = "🟢"
-                        color = "green"
-                    elif accuracy >= 60:
+                        status = "Strong"
+                    elif file_accuracy >= 60:
                         emoji = "🟡"
-                        color = "orange"
+                        status = "Moderate"
                     else:
                         emoji = "🔴"
-                        color = "red"
+                        status = "Needs Practice"
                     
-                    display_text = f"{emoji} {source_ref[:60]}{file_info} - {accuracy:.1f}% ({attempts} questions)"
-                    with st.expander(display_text):
-                        col1, col2, col3 = st.columns(3)
+                    # Get filename for display (prefer stored filename, fallback to hash)
+                    display_filename = file_data.get("filename")
+                    if not display_filename or display_filename == "unknown_file":
+                        # Try to extract meaningful name from chunks
+                        from src.core.analytics import extract_file_name_from_chunks
+                        chunks = file_data.get("chunks", {})
+                        extracted_name = extract_file_name_from_chunks(file_hash, chunks)
+                        if extracted_name:
+                            display_filename = extracted_name
+                        else:
+                            display_filename = f"File {file_hash[:8]}..."
+                    else:
+                        # Show just the filename, truncate if too long
+                        from pathlib import Path
+                        display_filename = Path(display_filename).name
+                        if len(display_filename) > 40:
+                            display_filename = display_filename[:37] + "..."
+                    
+                    # Create file-level display text
+                    file_display = f"{emoji} {display_filename} - {file_accuracy:.1f}% ({file_attempts} question{'s' if file_attempts != 1 else ''}, {chunks_with_data} section{'s' if chunks_with_data != 1 else ''})"
+                    
+                    with st.expander(file_display, expanded=False):
+                        st.markdown(f"**File Status:** {status}")
+                        col1, col2, col3, col4 = st.columns(4)
                         with col1:
-                            st.metric("Accuracy", f"{accuracy:.1f}%")
+                            st.metric("File Accuracy", f"{file_accuracy:.1f}%")
                         with col2:
-                            st.metric("Questions", attempts)
+                            st.metric("Total Questions", file_attempts)
                         with col3:
-                            st.metric("Correct", perf.get("correct", 0))
-                        st.write(f"**Incorrect:** {perf.get('incorrect', 0)}")
-                        st.write(f"**Chunk ID:** {chunk_id}")
-                        if perf.get("last_attempt"):
-                            st.write(f"**Last Attempt:** {perf['last_attempt']}")
+                            st.metric("Correct", file_data.get("total_correct", 0))
+                        with col4:
+                            st.metric("Sections Tested", chunks_with_data)
+                        
+                        st.write(f"**Incorrect:** {file_data.get('total_incorrect', 0)}")
+                        if file_data.get("last_attempt"):
+                            from datetime import datetime
+                            try:
+                                last_attempt_dt = datetime.fromisoformat(file_data['last_attempt'].replace('Z', '+00:00'))
+                                st.write(f"**Last Attempt:** {last_attempt_dt.strftime('%Y-%m-%d %H:%M')}")
+                            except:
+                                st.write(f"**Last Attempt:** {file_data['last_attempt']}")
+                        
+                        st.divider()
+                        
+                        # Show chunks within this file
+                        st.subheader(f"📑 Sections in this File ({chunks_count} total)")
+                        chunks = file_data.get("chunks", {})
+                        
+                        if chunks:
+                            # Sort chunks by chunk number if possible
+                            sorted_chunks = sorted(
+                                chunks.items(),
+                                key=lambda x: (
+                                    int(x[0].split("_chunk_")[1]) if "_chunk_" in x[0] and x[0].split("_chunk_")[1].isdigit() else 999,
+                                    -x[1].get("accuracy", 0)
+                                )
+                            )
+                            
+                            for chunk_id, chunk_perf in sorted_chunks:
+                                chunk_accuracy = chunk_perf.get("accuracy", 0.0)
+                                chunk_attempts = chunk_perf.get("attempts", 0)
+                                source_ref = chunk_perf.get("source_reference", chunk_id)
+                                
+                                # Format topic name for user-friendly display
+                                topic_name = format_topic_name(source_ref, max_length=45)
+                                
+                                # Color code based on chunk performance
+                                if chunk_accuracy >= 80:
+                                    chunk_emoji = "🟢"
+                                    chunk_status = "Strong"
+                                elif chunk_accuracy >= 60:
+                                    chunk_emoji = "🟡"
+                                    chunk_status = "Moderate"
+                                else:
+                                    chunk_emoji = "🔴"
+                                    chunk_status = "Needs Practice"
+                                
+                                # Only show chunks with attempts
+                                if chunk_attempts > 0:
+                                    chunk_display = f"{chunk_emoji} {topic_name} - {chunk_accuracy:.1f}% ({chunk_attempts} question{'s' if chunk_attempts != 1 else ''})"
+                                    
+                                    with st.expander(chunk_display, expanded=False):
+                                        st.markdown(f"**Status:** {chunk_status}")
+                                        col1, col2, col3 = st.columns(3)
+                                        with col1:
+                                            st.metric("Accuracy", f"{chunk_accuracy:.1f}%")
+                                        with col2:
+                                            st.metric("Questions", chunk_attempts)
+                                        with col3:
+                                            st.metric("Correct", chunk_perf.get("correct", 0))
+                                        st.write(f"**Incorrect:** {chunk_perf.get('incorrect', 0)}")
+                                        if chunk_perf.get("last_attempt"):
+                                            from datetime import datetime
+                                            try:
+                                                last_attempt_dt = datetime.fromisoformat(chunk_perf['last_attempt'].replace('Z', '+00:00'))
+                                                st.write(f"**Last Attempt:** {last_attempt_dt.strftime('%Y-%m-%d %H:%M')}")
+                                            except:
+                                                st.write(f"**Last Attempt:** {chunk_perf['last_attempt']}")
+                                        with st.expander("📄 View Source Reference", expanded=False):
+                                            st.text(source_ref)
+                        else:
+                            st.info("No sections tested in this file yet.")
             
             st.divider()
             
@@ -988,7 +1101,9 @@ def main():
             weak_areas = get_weak_areas(threshold=60.0, min_attempts=2, username=username)
             if weak_areas:
                 for area in weak_areas[:10]:  # Show top 10 weakest
-                    with st.expander(f"🔴 {area['source_reference'][:80]} - {area['accuracy']:.1f}% accuracy"):
+                    topic_name = format_topic_name(area['source_reference'], max_length=55)
+                    with st.expander(f"🔴 {topic_name} - {area['accuracy']:.1f}% accuracy"):
+                        st.markdown("**Status:** Needs Practice")
                         col1, col2, col3 = st.columns(3)
                         with col1:
                             st.metric("Accuracy", f"{area['accuracy']:.1f}%")
@@ -998,7 +1113,14 @@ def main():
                             st.metric("Correct", area['correct'])
                         st.write(f"**Incorrect:** {area['incorrect']}")
                         if area.get('last_attempt'):
-                            st.write(f"**Last Attempt:** {area['last_attempt']}")
+                            from datetime import datetime
+                            try:
+                                last_attempt_dt = datetime.fromisoformat(area['last_attempt'].replace('Z', '+00:00'))
+                                st.write(f"**Last Attempt:** {last_attempt_dt.strftime('%Y-%m-%d %H:%M')}")
+                            except:
+                                st.write(f"**Last Attempt:** {area['last_attempt']}")
+                        with st.expander("📄 View Source Reference", expanded=False):
+                            st.text(area['source_reference'])
             else:
                 st.info("No weak areas identified yet. Keep practicing!")
             
@@ -1009,7 +1131,9 @@ def main():
             strong_areas = get_strong_areas(threshold=80.0, min_attempts=2, username=username)
             if strong_areas:
                 for area in strong_areas[:10]:  # Show top 10 strongest
-                    with st.expander(f"🟢 {area['source_reference'][:80]} - {area['accuracy']:.1f}% accuracy"):
+                    topic_name = format_topic_name(area['source_reference'], max_length=55)
+                    with st.expander(f"🟢 {topic_name} - {area['accuracy']:.1f}% accuracy"):
+                        st.markdown("**Status:** Strong")
                         col1, col2, col3 = st.columns(3)
                         with col1:
                             st.metric("Accuracy", f"{area['accuracy']:.1f}%")
@@ -1019,7 +1143,14 @@ def main():
                             st.metric("Correct", area['correct'])
                         st.write(f"**Incorrect:** {area['incorrect']}")
                         if area.get('last_attempt'):
-                            st.write(f"**Last Attempt:** {area['last_attempt']}")
+                            from datetime import datetime
+                            try:
+                                last_attempt_dt = datetime.fromisoformat(area['last_attempt'].replace('Z', '+00:00'))
+                                st.write(f"**Last Attempt:** {last_attempt_dt.strftime('%Y-%m-%d %H:%M')}")
+                            except:
+                                st.write(f"**Last Attempt:** {area['last_attempt']}")
+                        with st.expander("📄 View Source Reference", expanded=False):
+                            st.text(area['source_reference'])
             else:
                 st.info("No strong areas identified yet. Keep practicing!")
         else:
@@ -1086,8 +1217,8 @@ def generate_content_for_mode(mode: str):
     with st.spinner(f"Generating {mode} content..."):
         # Pass chunks directly as fallback if available in session state
         params = {
-            "content_type": mode,
-            "session_id": st.session_state.session_id
+                "content_type": mode,
+                "session_id": st.session_state.session_id
         }
         # Add chunks from session state as fallback AND primary source
         if st.session_state.extracted_chunks:
@@ -1141,8 +1272,8 @@ def generate_mixed_bundle():
     with st.spinner("Generating mixed content bundle..."):
         # Pass chunks directly as fallback if available in session state
         params = {
-            "content_type": ContentType.MIXED.value,
-            "session_id": st.session_state.session_id
+                "content_type": ContentType.MIXED.value,
+                "session_id": st.session_state.session_id
         }
         # Add chunks from session state as fallback AND primary source
         if st.session_state.extracted_chunks:

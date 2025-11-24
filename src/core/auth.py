@@ -38,8 +38,19 @@ def load_users() -> Dict[str, User]:
         return {}
     
     try:
+        # Check if file is empty
+        if users_path.stat().st_size == 0:
+            # Initialize empty file
+            with open(users_path, 'w') as f:
+                json.dump({}, f)
+            return {}
+        
         with open(users_path, 'r') as f:
             data = json.load(f)
+        
+        # Handle case where file contains empty dict or None
+        if not data or not isinstance(data, dict):
+            return {}
         
         users = {}
         for username, user_data in data.items():
@@ -48,6 +59,12 @@ def load_users() -> Dict[str, User]:
         return users
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         logger.get_logger().error(f"Error loading users: {e}")
+        # Initialize corrupted file with empty dict
+        try:
+            with open(users_path, 'w') as f:
+                json.dump({}, f)
+        except Exception:
+            pass
         return {}
 
 

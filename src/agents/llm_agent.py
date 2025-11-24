@@ -3,6 +3,7 @@
 import json
 import os
 from typing import Dict, Any
+from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -78,13 +79,16 @@ class LLMAgent:
         self.logger.info(f"Generating quiz with {len(chunks)} chunks, total length: {sum(len(c) for c in chunks)} chars")
         
         num_questions = request.num_items or 5
+        self.logger.info(f"Quiz generation requested: {num_questions} questions")
         # Create numbered chunks for reference
         chunks_with_numbers = []
+        chunk_objects = []  # Store (index, chunk) pairs for filtering
+        
         for i, chunk in enumerate(chunks, 1):
             if chunk.strip():  # Only include non-empty chunks
-                chunks_with_numbers.append(f"[Chunk {i}]\n{chunk}")
+                chunk_objects.append((i, chunk))
         
-        if not chunks_with_numbers:
+        if not chunk_objects:
             return GenerationResponse(
                 content_type=ContentType.QUIZ,
                 data={},
@@ -92,13 +96,71 @@ class LLMAgent:
                 error="All chunks are empty. PDF extraction may have failed."
             )
         
+        # Filter out very short chunks or simple lists (likely not useful for questions)
+        # Keep chunks that are substantial (more than just a list of terms)
+        filtered_chunks = []
+        for i, chunk in chunk_objects:
+            # Skip chunks that are just comma-separated lists with no sentences
+            # A chunk is likely a simple list if it has many commas but few periods/question marks
+            comma_count = chunk.count(',')
+            sentence_endings = chunk.count('.') + chunk.count('?') + chunk.count('!')
+            word_count = len(chunk.split())
+            
+            # Keep chunk if it has substantial content (sentences) or is long enough
+            if sentence_endings > 0 or word_count > 20 or comma_count < 5:
+                filtered_chunks.append((i, chunk))
+            else:
+                self.logger.debug(f"Skipping Chunk {i} - appears to be a simple list")
+        
+        # If we filtered out too many, keep some of the filtered ones
+        if len(filtered_chunks) < num_questions:
+            # Add back some of the filtered chunks to ensure we have enough
+            needed = num_questions - len(filtered_chunks)
+            for i, chunk in chunk_objects:
+                if (i, chunk) not in filtered_chunks and needed > 0:
+                    filtered_chunks.append((i, chunk))
+                    needed -= 1
+        
+        # For better diversity, sample chunks from across the document
+        if len(filtered_chunks) > 20:  # If we have many chunks, sample strategically
+            import random
+            # Sample evenly across the document
+            num_to_sample = min(50, len(filtered_chunks))
+            if num_to_sample < len(filtered_chunks):
+                step = max(1, len(filtered_chunks) // num_to_sample)
+                sampled = [filtered_chunks[i] for i in range(0, len(filtered_chunks), step)][:num_to_sample]
+                # Add some random chunks for extra diversity
+                if len(filtered_chunks) > num_to_sample:
+                    random_indices = random.sample(range(len(filtered_chunks)), min(10, len(filtered_chunks) - num_to_sample))
+                    for idx in random_indices:
+                        if filtered_chunks[idx] not in sampled:
+                            sampled.append(filtered_chunks[idx])
+                filtered_chunks = sampled
+                self.logger.info(f"Sampled {len(filtered_chunks)} chunks from {len(chunk_objects)} total chunks for diversity")
+        
+        # Format chunks with numbers
+        for i, chunk in filtered_chunks:
+            chunks_with_numbers.append(f"[Chunk {i}]\n{chunk}")
+        
         chunks_text = "\n\n".join(chunks_with_numbers)
         
-        # Limit total text to avoid token limits (keep it reasonable)
-        max_chars = 8000  # Leave room for prompt and response
+        # Limit total text to avoid token limits (GPT-4o-mini has 128k context, so we can use more)
+        # Using ~50k chars (~12k tokens) leaves plenty of room for prompt and response
+        max_chars = 50000
         if len(chunks_text) > max_chars:
             self.logger.warning(f"Chunks text too long ({len(chunks_text)} chars), truncating to {max_chars}")
-            chunks_text = chunks_text[:max_chars] + "\n\n[Content truncated...]"
+            # Instead of just truncating, try to include complete chunks
+            truncated_chunks = []
+            current_length = 0
+            for chunk in chunks_with_numbers:
+                if current_length + len(chunk) + 2 <= max_chars:  # +2 for "\n\n"
+                    truncated_chunks.append(chunk)
+                    current_length += len(chunk) + 2
+                else:
+                    break
+            chunks_text = "\n\n".join(truncated_chunks)
+            if len(chunks_with_numbers) > len(truncated_chunks):
+                chunks_text += f"\n\n[Note: {len(chunks_with_numbers) - len(truncated_chunks)} additional chunks were truncated due to length limits]"
         
         # Build feedback adaptation section
         feedback_section = ""
@@ -125,7 +187,7 @@ Please adapt the quiz questions accordingly while still using ONLY the source co
 3. DO NOT add facts, examples, definitions, or information NOT in the source
 4. DO NOT paraphrase or interpret - use the EXACT wording from the source when possible
 5. If information is not in the source, DO NOT include it in questions, options, or answers
-6. If the source doesn't contain enough information for {num_questions} questions, generate FEWER questions (even just 1-2 if needed)
+6. IMPORTANT: With {len(chunks_with_numbers)} chunks of content provided, you should be able to generate {num_questions} questions. Only generate fewer if you truly cannot find enough distinct information. Try to use different chunks for different questions.
 7. Every question, option, and explanation MUST be directly traceable to a SPECIFIC chunk number
 8. For each question, you MUST quote or reference the EXACT text from the source that supports it
 9. If you cannot find the answer in the source, DO NOT create that question
@@ -136,7 +198,21 @@ Please adapt the quiz questions accordingly while still using ONLY the source co
 Source Content (numbered by chunk):
 {chunks_text}
 
-Generate {num_questions} multiple-choice quiz questions. Return a JSON object with this exact structure:
+CRITICAL REQUIREMENT: You have {len(chunks_with_numbers)} chunks of content available (over 50,000 characters). This is MORE than enough material to create {num_questions} questions.
+
+YOU MUST GENERATE EXACTLY {num_questions} QUESTIONS - NO FEWER, NO MORE.
+
+⚠️ CRITICAL DIVERSITY REQUIREMENT - VIOLATION WILL RESULT IN POOR QUALITY:
+- You MUST use DIFFERENT chunks for DIFFERENT questions - NO EXCEPTIONS
+- DO NOT use the same chunk for multiple questions - each question MUST come from a different chunk
+- Question 1 should use Chunk X, Question 2 should use Chunk Y (different from X), Question 3 should use Chunk Z (different from X and Y), etc.
+- Spread questions across as many different chunks as possible (aim to use at least {min(num_questions, len(chunks_with_numbers))} different chunks)
+- If you see a chunk that's just a simple list (like "Term1, Term2, Term3"), SKIP IT and use chunks with more detailed content
+- Prioritize chunks with substantial content over simple lists or headings
+- Before creating each question, check: "Have I already used this chunk number?" If YES, use a different chunk
+- The source_reference MUST show different chunk numbers for different questions
+
+Generate EXACTLY {num_questions} multiple-choice quiz questions. Return a JSON object with this exact structure:
 {{
   "questions": [
     {{
@@ -155,7 +231,16 @@ VALIDATION CHECKLIST before generating each question:
 - [ ] Are all options based on information in the source?
 - [ ] Have I NOT added any external knowledge?
 
-REMEMBER: If you cannot create a question using ONLY the source content, create fewer questions. NEVER invent information. It's better to have 1 accurate question than 5 invented ones."""
+FINAL REMINDER: 
+- You have {len(chunks_with_numbers)} chunks with over 50,000 characters of content
+- You MUST return EXACTLY {num_questions} questions in the "questions" array
+- CRITICAL: Use DIFFERENT chunks for different questions - each question MUST have a different chunk number in source_reference
+- DO NOT use the same chunk twice - if you see "Chunk 1" in one question, use "Chunk 2", "Chunk 3", etc. for other questions
+- Skip simple list chunks - prioritize chunks with detailed explanations or substantial content
+- NEVER invent information - only use what's explicitly in the source
+- The JSON must have exactly {num_questions} items in the questions array
+- DO NOT return fewer than {num_questions} questions
+- Verify: Check that your source_reference values show different chunk numbers for each question"""
         
         system_message = """You are an educational content generator. Your ONLY job is to create quiz questions based EXCLUSIVELY on the source content provided by the user.
 
@@ -174,18 +259,87 @@ VALIDATION: Before including any information, ask: "Is this EXPLICITLY stated in
 Always return valid JSON. NEVER hallucinate or add external knowledge. Better to have fewer accurate questions than many invented ones."""
         
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_message},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,  # Very low temperature to minimize creativity/hallucination
-                response_format={"type": "json_object"}
-            )
+            max_retries = 1  # Reduced to 1 retry for speed (only retry if < 50% of requested)
+            questions = []
             
-            content = response.choices[0].message.content
-            data = json.loads(content)
+            for attempt in range(max_retries + 1):
+                if attempt > 0:
+                    # On retry, be more explicit about needing the exact number
+                    retry_prompt = f"""You previously generated only {len(questions)} questions, but I need EXACTLY {num_questions} questions.
+
+You have {len(chunks_with_numbers)} chunks of content available. This is MORE than enough to create {num_questions} questions.
+
+REQUIREMENT: Generate EXACTLY {num_questions} questions. Use different chunks for different questions. Even if some chunks have less information, you can still create questions from them.
+
+Here is the source content again:
+{chunks_text}
+
+Generate EXACTLY {num_questions} multiple-choice quiz questions. Return a JSON object with this exact structure:
+{{
+  "questions": [
+    {{
+      "question": "Question text here (MUST be answerable DIRECTLY from source content - quote the relevant part)",
+      "options": ["Option A (from source)", "Option B (from source)", "Option C (from source)", "Option D (from source)"],
+      "correct_answer": 0,
+      "explanation": "Explanation with DIRECT QUOTE from source content showing where this answer comes from",
+      "source_reference": "Chunk [NUMBER] - EXACT quote: '...' from the source above. IMPORTANT: Use the ACTUAL chunk number from the source (e.g., if content is from [Chunk 2], write 'Chunk 2', not 'Chunk 1' or 'Chunk X')"
+    }}
+  ]
+}}
+
+You MUST return EXACTLY {num_questions} questions in the array."""
+                    current_prompt = retry_prompt
+                else:
+                    current_prompt = prompt
+                
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_message},
+                        {"role": "user", "content": current_prompt}
+                    ],
+                    temperature=0.1,  # Very low temperature to minimize creativity/hallucination
+                    response_format={"type": "json_object"}
+                )
+                
+                content = response.choices[0].message.content
+                data = json.loads(content)
+                
+                # Validate that we got questions
+                questions = data.get("questions", [])
+                if not questions or len(questions) == 0:
+                    if attempt < max_retries:
+                        self.logger.warning(f"Attempt {attempt + 1}: Quiz generation returned empty questions array, retrying...")
+                        continue
+                    else:
+                        self.logger.error("Quiz generation returned empty questions array after all retries")
+                        return GenerationResponse(
+                            content_type=ContentType.QUIZ,
+                            data={},
+                            success=False,
+                            error="No questions were generated. The source content may not contain enough information."
+                        )
+                
+                # If we got enough questions, break
+                if len(questions) >= num_questions:
+                    break
+                
+                # Only retry if we got significantly fewer questions (< 50% of requested)
+                # This avoids unnecessary retries for small differences
+                if len(questions) < (num_questions * 0.5) and attempt < max_retries:
+                    self.logger.warning(f"Attempt {attempt + 1}: Generated {len(questions)} questions but {num_questions} were requested. Retrying to get more...")
+                elif attempt < max_retries:
+                    # Got at least 50% but not all - accept it to save time
+                    self.logger.info(f"Generated {len(questions)} questions (requested {num_questions}). Accepting result to save time.")
+                    break
+                else:
+                    self.logger.warning(f"Generated {len(questions)} questions but {num_questions} were requested after {max_retries + 1} attempts.")
+            
+            # Log final result
+            if len(questions) >= num_questions:
+                self.logger.info(f"Successfully generated {len(questions)} quiz questions (requested: {num_questions})")
+            else:
+                self.logger.warning(f"Final result: Generated {len(questions)} questions but {num_questions} were requested.")
             
             # Store chunks for source reference display
             data["_source_chunks"] = chunks
@@ -237,11 +391,23 @@ Always return valid JSON. NEVER hallucinate or add external knowledge. Better to
         
         chunks_text = "\n\n".join(chunks_with_numbers)
         
-        # Limit total text to avoid token limits
-        max_chars = 8000
+        # Limit total text to avoid token limits (GPT-4o-mini has 128k context, so we can use more)
+        # Using ~50k chars (~12k tokens) leaves plenty of room for prompt and response
+        max_chars = 50000
         if len(chunks_text) > max_chars:
             self.logger.warning(f"Chunks text too long ({len(chunks_text)} chars), truncating to {max_chars}")
-            chunks_text = chunks_text[:max_chars] + "\n\n[Content truncated...]"
+            # Instead of just truncating, try to include complete chunks
+            truncated_chunks = []
+            current_length = 0
+            for chunk in chunks_with_numbers:
+                if current_length + len(chunk) + 2 <= max_chars:  # +2 for "\n\n"
+                    truncated_chunks.append(chunk)
+                    current_length += len(chunk) + 2
+                else:
+                    break
+            chunks_text = "\n\n".join(truncated_chunks)
+            if len(chunks_with_numbers) > len(truncated_chunks):
+                chunks_text += f"\n\n[Note: {len(chunks_with_numbers) - len(truncated_chunks)} additional chunks were truncated due to length limits]"
         
         # Build feedback adaptation section
         feedback_section = ""
@@ -372,11 +538,23 @@ Always return valid JSON. NEVER hallucinate or add external knowledge. Better to
         
         chunks_text = "\n\n".join(chunks_with_numbers)
         
-        # Limit total text to avoid token limits
-        max_chars = 8000
+        # Limit total text to avoid token limits (GPT-4o-mini has 128k context, so we can use more)
+        # Using ~50k chars (~12k tokens) leaves plenty of room for prompt and response
+        max_chars = 50000
         if len(chunks_text) > max_chars:
             self.logger.warning(f"Chunks text too long ({len(chunks_text)} chars), truncating to {max_chars}")
-            chunks_text = chunks_text[:max_chars] + "\n\n[Content truncated...]"
+            # Instead of just truncating, try to include complete chunks
+            truncated_chunks = []
+            current_length = 0
+            for chunk in chunks_with_numbers:
+                if current_length + len(chunk) + 2 <= max_chars:  # +2 for "\n\n"
+                    truncated_chunks.append(chunk)
+                    current_length += len(chunk) + 2
+                else:
+                    break
+            chunks_text = "\n\n".join(truncated_chunks)
+            if len(chunks_with_numbers) > len(truncated_chunks):
+                chunks_text += f"\n\n[Note: {len(chunks_with_numbers) - len(truncated_chunks)} additional chunks were truncated due to length limits]"
         
         # Build feedback adaptation section
         feedback_section = ""
@@ -511,29 +689,40 @@ Always return valid JSON. NEVER hallucinate or add external knowledge. Better to
                 if interactive_feedback and "adaptive_count" in interactive_feedback:
                     interactive_count = interactive_feedback["adaptive_count"]
         
+        # Generate all three content types in parallel for speed
         quiz_request = GenerationRequest(
             content_type=ContentType.QUIZ,
             chunks=request.chunks,
             num_items=quiz_count,
             feedback_context=quiz_feedback
         )
-        quiz_response = self.generate_quiz(quiz_request)
-        
         flashcard_request = GenerationRequest(
             content_type=ContentType.FLASHCARD,
             chunks=request.chunks,
             num_items=flashcard_count,
             feedback_context=flashcard_feedback
         )
-        flashcard_response = self.generate_flashcards(flashcard_request)
-        
         interactive_request = GenerationRequest(
             content_type=ContentType.INTERACTIVE,
             chunks=request.chunks,
             num_items=interactive_count,
             feedback_context=interactive_feedback
         )
-        interactive_response = self.generate_interactive(interactive_request)
+        
+        # Generate all three in parallel
+        self.logger.info("Starting parallel generation of quiz, flashcards, and interactive content...")
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            # Submit all three tasks
+            quiz_future = executor.submit(self.generate_quiz, quiz_request)
+            flashcard_future = executor.submit(self.generate_flashcards, flashcard_request)
+            interactive_future = executor.submit(self.generate_interactive, interactive_request)
+            
+            # Wait for all to complete and get results
+            quiz_response = quiz_future.result()
+            flashcard_response = flashcard_future.result()
+            interactive_response = interactive_future.result()
+        
+        self.logger.info("Parallel generation completed")
         
         # Combine into mixed bundle
         # Include data even if generation had errors, as long as we have some content

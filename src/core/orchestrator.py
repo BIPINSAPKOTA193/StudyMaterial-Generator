@@ -168,10 +168,15 @@ class ManagerAgent:
             base_flashcard = self._calculate_item_count(ContentType.FLASHCARD, len(chunks))
             base_interactive = self._calculate_item_count(ContentType.INTERACTIVE, len(chunks))
             
+            self.logger.info(f"Base counts for {len(chunks)} chunks: quiz={base_quiz}, flashcard={base_flashcard}, interactive={base_interactive}")
+            
             # Adjust based on feedback
             quiz_count = self._calculate_adaptive_count(base_quiz, quiz_fc, "quiz")
             flashcard_count = self._calculate_adaptive_count(base_flashcard, flashcard_fc, "flashcard")
             interactive_count = self._calculate_adaptive_count(base_interactive, interactive_fc, "interactive")
+            
+            if quiz_count != base_quiz:
+                self.logger.info(f"Quiz count adjusted from {base_quiz} to {quiz_count} based on feedback")
             
             # Store in feedback_context for LLM agent to use
             feedback_context["quiz"]["adaptive_count"] = quiz_count
@@ -232,30 +237,44 @@ class ManagerAgent:
     
     def _handle_update_rl(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Route feedback update to RL Agent"""
-        from ..agents.rl_agent import RLAgent
-        
-        rl_agent = RLAgent(username=self.username)
-        request = RLUpdateRequest(**params)
-        rl_agent.update_from_feedback(request)
-        
-        # Reload state after update
-        self.state = load_state(self.username)
-        
-        return {"success": True}
+        try:
+            from ..agents.rl_agent import RLAgent
+            
+            rl_agent = RLAgent(username=self.username)
+            request = RLUpdateRequest(**params)
+            rl_agent.update_from_feedback(request)
+            
+            # Reload state after update
+            self.state = load_state(self.username)
+            
+            return {"success": True}
+        except Exception as e:
+            self.logger.exception(f"Error updating RL state: {e}")
+            return {"success": False, "error": str(e)}
     
     def _handle_recommend(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Get recommendation from RL Agent"""
-        from ..agents.rl_agent import RLAgent
-        
-        rl_agent = RLAgent(username=self.username)
-        recommendation = rl_agent.recommend_mode()
-        
-        return {
-            "success": True,
-            "recommended_mode": recommendation.recommended_mode,
-            "probabilities": recommendation.probabilities,
-            "confidence": recommendation.confidence
-        }
+        try:
+            from ..agents.rl_agent import RLAgent
+            
+            rl_agent = RLAgent(username=self.username)
+            recommendation = rl_agent.recommend_mode()
+            
+            return {
+                "success": True,
+                "recommended_mode": recommendation.recommended_mode,
+                "probabilities": recommendation.probabilities,
+                "confidence": recommendation.confidence
+            }
+        except Exception as e:
+            self.logger.exception(f"Error getting RL recommendation: {e}")
+            # Return default recommendation on error
+            return {
+                "success": True,
+                "recommended_mode": "quiz",  # Safe default
+                "probabilities": {"quiz": 0.5, "flashcard": 0.5, "interactive": 0.5},
+                "confidence": 0.0
+            }
     
     def _handle_survey(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handle survey response"""
@@ -288,11 +307,25 @@ class ManagerAgent:
     def _calculate_item_count(self, content_type: ContentType, num_chunks: int) -> int:
         """Dynamically calculate number of items based on document length"""
         if content_type == ContentType.QUIZ:
-            return min(10, max(3, num_chunks // 2))
+            # For large files (100+ chunks), generate more questions
+            if num_chunks >= 100:
+                return min(20, max(10, num_chunks // 10))  # 10-20 questions for large files
+            elif num_chunks >= 50:
+                return min(15, max(8, num_chunks // 8))  # 8-15 for medium files
+            else:
+                return min(10, max(3, num_chunks // 2))  # 3-10 for small files
         elif content_type == ContentType.FLASHCARD:
-            return min(15, max(5, num_chunks))
+            # For large files, generate more flashcards
+            if num_chunks >= 100:
+                return min(25, max(15, num_chunks // 8))  # 15-25 for large files
+            else:
+                return min(15, max(5, num_chunks))  # 5-15 for smaller files
         elif content_type == ContentType.INTERACTIVE:
-            return min(5, max(2, num_chunks // 3))
+            # For large files, generate more steps
+            if num_chunks >= 100:
+                return min(8, max(5, num_chunks // 30))  # 5-8 for large files
+            else:
+                return min(5, max(2, num_chunks // 3))  # 2-5 for smaller files
         else:
             return 5
     

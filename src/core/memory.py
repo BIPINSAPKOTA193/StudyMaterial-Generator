@@ -28,6 +28,9 @@ class RLState:
     # Session tracking
     total_sessions: int = 0
     last_updated: Optional[str] = None
+    
+    # File hash to filename mapping (for analytics display)
+    file_mapping: Optional[Dict[str, str]] = field(default_factory=dict)  # file_hash -> filename
 
 
 def get_state_path(username: Optional[str] = None) -> Path:
@@ -52,7 +55,8 @@ def load_state(username: Optional[str] = None) -> RLState:
             survey_completed=False,
             initial_preference=None,
             total_sessions=0,
-            last_updated=None
+            last_updated=None,
+            file_mapping={}
         )
     
     try:
@@ -71,9 +75,15 @@ def load_state(username: Optional[str] = None) -> RLState:
         if "chunk_performance" not in data:
             data["chunk_performance"] = {}
         
+        # Ensure file_mapping exists
+        if "file_mapping" not in data:
+            data["file_mapping"] = {}
+        
         return RLState(**data)
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         # If file is corrupted, return default state
+        from .logger import logger
+        logger.get_logger().warning(f"Corrupted state file for user {username}. Using default state.")
         return RLState(
             mode_alpha={"quiz": 1.0, "flashcard": 1.0, "interactive": 1.0},
             mode_beta={"quiz": 1.0, "flashcard": 1.0, "interactive": 1.0},
@@ -82,7 +92,8 @@ def load_state(username: Optional[str] = None) -> RLState:
             survey_completed=False,
             initial_preference=None,
             total_sessions=0,
-            last_updated=None
+            last_updated=None,
+            file_mapping={}
         )
 
 
@@ -97,11 +108,18 @@ def save_state(state: RLState, username: Optional[str] = None) -> bool:
         # Ensure directory exists
         state_path.parent.mkdir(parents=True, exist_ok=True)
         
-        with open(state_path, 'w') as f:
+        # Write to temporary file first, then rename (atomic write)
+        temp_path = state_path.with_suffix('.tmp')
+        with open(temp_path, 'w') as f:
             json.dump(data, f, indent=2)
+        
+        # Atomic rename (works on most filesystems)
+        temp_path.replace(state_path)
         
         return True
     except Exception as e:
+        from .logger import logger
+        logger.get_logger().error(f"Failed to save RL state: {e}")
         return False
 
 
@@ -115,7 +133,8 @@ def reset_state(username: Optional[str] = None) -> RLState:
         survey_completed=False,
         initial_preference=None,
         total_sessions=0,
-        last_updated=None
+        last_updated=None,
+        file_mapping={}
     )
     save_state(state, username)
     return state

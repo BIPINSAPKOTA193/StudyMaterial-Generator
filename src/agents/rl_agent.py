@@ -15,7 +15,23 @@ class RLAgent:
     def __init__(self, username: Optional[str] = None):
         self.logger = logger.get_logger()
         self.username = username
-        self.state: RLState = load_state(username)
+        try:
+            self.state: RLState = load_state(username)
+        except Exception as e:
+            self.logger.error(f"Failed to load RL state: {e}. Using default state.")
+            # Initialize with default state if loading fails
+            from ..core.memory import RLState
+            self.state = RLState(
+                mode_alpha={"quiz": 1.0, "flashcard": 1.0, "interactive": 1.0},
+                mode_beta={"quiz": 1.0, "flashcard": 1.0, "interactive": 1.0},
+                mode_history=[],
+                chunk_performance={},
+                survey_completed=False,
+                initial_preference=None,
+                total_sessions=0,
+                last_updated=None,
+                file_mapping={}
+            )
         self.modes = ["quiz", "flashcard", "interactive"]
     
     def update_from_feedback(self, request: RLUpdateRequest):
@@ -62,14 +78,19 @@ class RLAgent:
         # Update metadata
         self.state.last_updated = datetime.now().isoformat()
         
-        # Save state
-        save_state(self.state, self.username)
+        # Limit history size to prevent unbounded growth (keep last 1000 entries)
+        if len(self.state.mode_history) > 1000:
+            self.state.mode_history = self.state.mode_history[-1000:]
         
-        self.logger.info(
-            f"Updated RL state for {mode}: "
-            f"alpha={self.state.mode_alpha[mode]:.2f}, "
-            f"beta={self.state.mode_beta[mode]:.2f}"
-        )
+        # Save state with error handling
+        if not save_state(self.state, self.username):
+            self.logger.error(f"Failed to save RL state for user {self.username}")
+        else:
+            self.logger.info(
+                f"Updated RL state for {mode}: "
+                f"alpha={self.state.mode_alpha[mode]:.2f}, "
+                f"beta={self.state.mode_beta[mode]:.2f}"
+            )
     
     def recommend_mode(self) -> RLRecommendation:
         """
@@ -79,7 +100,11 @@ class RLAgent:
             RLRecommendation with recommended mode and probabilities
         """
         # Reload state to get latest feedback
-        self.state = load_state(self.username)
+        try:
+            self.state = load_state(self.username)
+        except Exception as e:
+            self.logger.warning(f"Failed to reload state: {e}. Using current state.")
+            # Continue with current state if reload fails
         
         # Sample from Beta distribution for each mode
         samples = {}
@@ -90,9 +115,19 @@ class RLAgent:
             alpha = self.state.mode_alpha.get(mode, 1.0)
             beta = self.state.mode_beta.get(mode, 1.0)
             
-            # Sample from Beta distribution
-            sample = np.random.beta(alpha, beta)
-            samples[mode] = sample
+            # Validate alpha and beta to prevent invalid Beta distribution
+            # Beta distribution requires alpha > 0 and beta > 0
+            alpha = max(0.1, alpha)  # Minimum 0.1 to avoid numerical issues
+            beta = max(0.1, beta)    # Minimum 0.1 to avoid numerical issues
+            
+            try:
+                # Sample from Beta distribution
+                sample = np.random.beta(alpha, beta)
+                samples[mode] = sample
+            except (ValueError, RuntimeError) as e:
+                # Fallback if Beta sampling fails
+                self.logger.warning(f"Beta sampling failed for {mode}: {e}. Using default.")
+                samples[mode] = 0.5
             
             # Calculate probability (normalized)
             # This represents the expected success rate

@@ -6,6 +6,36 @@ from collections import defaultdict
 
 from .memory import load_state, save_state
 from .logger import logger
+import hashlib
+
+
+def register_file(filename: str, username: Optional[str] = None) -> str:
+    """
+    Register a file and create a mapping from file hash to filename.
+    
+    Args:
+        filename: The actual filename
+        username: Username for user-specific state (optional)
+        
+    Returns:
+        File hash (8-character hex string)
+    """
+    state = load_state(username)
+    
+    # Ensure file_mapping exists
+    if not hasattr(state, 'file_mapping') or state.file_mapping is None:
+        state.file_mapping = {}
+    
+    # Create hash from filename
+    file_hash = hashlib.md5(filename.encode()).hexdigest()[:8]
+    
+    # Store mapping if not already present
+    if file_hash not in state.file_mapping:
+        state.file_mapping[file_hash] = filename
+        save_state(state, username)
+        logger.get_logger().info(f"Registered file: {filename} -> {file_hash}")
+    
+    return file_hash
 
 
 def record_quiz_answer(
@@ -13,7 +43,8 @@ def record_quiz_answer(
     source_reference: str,
     is_correct: bool,
     question_text: str = "",
-    username: Optional[str] = None
+    username: Optional[str] = None,
+    filename: Optional[str] = None
 ) -> None:
     """
     Record a quiz answer performance for a specific chunk.
@@ -41,8 +72,12 @@ def record_quiz_answer(
             "attempts": 0,
             "last_attempt": None,
             "source_reference": source_reference,
+            "filename": filename,  # Store filename for display
             "questions": []
         }
+    # Update filename if not set (for existing chunks)
+    elif filename and not state.chunk_performance[key].get("filename"):
+        state.chunk_performance[key]["filename"] = filename
     
     # Update performance
     state.chunk_performance[key]["attempts"] += 1
@@ -138,10 +173,167 @@ def get_all_chunk_performance(username: Optional[str] = None) -> Dict[str, Dict[
             "attempts": attempts,
             "accuracy": accuracy,
             "source_reference": perf.get("source_reference", ""),
+            "filename": perf.get("filename"),  # Include filename
             "last_attempt": perf.get("last_attempt")
         }
     
     return result
+
+
+def extract_file_name_from_chunks(file_hash: str, chunks: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    """
+    Try to extract a meaningful file name from chunk source references.
+    This is a fallback when filename isn't stored in the mapping.
+    
+    Args:
+        file_hash: The file hash
+        chunks: Dictionary of chunks for this file
+        
+    Returns:
+        A suggested file name or None
+    """
+    # Try to find a filename in any chunk
+    for chunk_perf in chunks.values():
+        filename = chunk_perf.get("filename")
+        if filename and filename != "unknown_file":
+            return filename
+    
+    # If no filename found, try to extract from source references
+    # Look for common patterns that might indicate a file/document name
+    for chunk_perf in chunks.values():
+        source_ref = chunk_perf.get("source_reference", "")
+        if source_ref:
+            # Try to extract meaningful content
+            topic = format_topic_name(source_ref, max_length=100)
+            # If it's a substantial topic name (not just "Section X"), use it
+            if len(topic) > 15 and not topic.startswith("Section"):
+                # Extract first few words as a potential document name
+                words = topic.split()[:5]
+                if len(words) >= 2:
+                    return " ".join(words) + "..."
+    
+    return None
+
+
+def backfill_file_mapping_from_chunks(username: Optional[str] = None) -> None:
+    """
+    Backfill file_mapping by extracting filenames from existing chunk data.
+    This helps recover filenames for data created before file registration was implemented.
+    """
+    state = load_state(username)
+    if not hasattr(state, 'chunk_performance') or not state.chunk_performance:
+        return
+    
+    if not hasattr(state, 'file_mapping') or state.file_mapping is None:
+        state.file_mapping = {}
+    
+    updated = False
+    for chunk_id, perf in state.chunk_performance.items():
+        filename = perf.get("filename")
+        if filename and filename != "unknown_file":
+            # Extract file hash from chunk_id
+            if "_chunk_" in chunk_id:
+                file_hash = chunk_id.split("_chunk_")[0]
+                # Register this file if not already registered
+                if file_hash not in state.file_mapping:
+                    state.file_mapping[file_hash] = filename
+                    updated = True
+                    logger.get_logger().info(f"Backfilled file mapping: {filename} -> {file_hash}")
+    
+    if updated:
+        save_state(state, username)
+
+
+def group_chunks_by_file(all_perf: Dict[str, Dict[str, Any]], username: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Group chunk performance by file (using file hash from chunk_id).
+    
+    Args:
+        all_perf: Dictionary mapping chunk_id to performance metrics
+        username: Username for user-specific state (optional)
+        
+    Returns:
+        Dictionary mapping file_hash to file-level aggregated performance and chunks
+    """
+    # First, try to backfill file mapping from existing chunk data
+    backfill_file_mapping_from_chunks(username)
+    
+    files = {}
+    
+    for chunk_id, perf in all_perf.items():
+        # Extract file hash from chunk_id (format: {file_hash}_chunk_{chunk_num})
+        if "_chunk_" in chunk_id:
+            file_hash = chunk_id.split("_chunk_")[0]
+            chunk_num = chunk_id.split("_chunk_")[1] if "_chunk_" in chunk_id else "unknown"
+        else:
+            # Legacy chunks without file hash - group under "unknown"
+            file_hash = "unknown"
+            chunk_num = chunk_id
+        
+        if file_hash not in files:
+            # Try to get filename from multiple sources:
+            # 1. From chunk performance data
+            filename = perf.get("filename")
+            # 2. From file mapping in state (for existing data)
+            if not filename or filename == "unknown_file":
+                state = load_state(username=username)  # Get from user-specific state
+                if hasattr(state, 'file_mapping') and state.file_mapping:
+                    filename = state.file_mapping.get(file_hash)
+            
+            files[file_hash] = {
+                "file_hash": file_hash,
+                "filename": filename,  # Store filename for display
+                "chunks": {},
+                "total_attempts": 0,
+                "total_correct": 0,
+                "total_incorrect": 0,
+                "chunks_with_data": 0
+            }
+        # Update filename if we find one and it's not set
+        elif perf.get("filename") and not files[file_hash].get("filename"):
+            filename = perf.get("filename")
+            files[file_hash]["filename"] = filename
+            # Auto-register this file in the mapping if we found a filename
+            if filename and filename != "unknown_file":
+                state = load_state(username=username)
+                if not hasattr(state, 'file_mapping') or state.file_mapping is None:
+                    state.file_mapping = {}
+                if file_hash not in state.file_mapping:
+                    state.file_mapping[file_hash] = filename
+                    save_state(state, username)
+                    logger.get_logger().info(f"Auto-registered file from chunk data: {filename} -> {file_hash}")
+        # Also check file mapping if filename still not set
+        elif not files[file_hash].get("filename") or files[file_hash].get("filename") == "unknown_file":
+            state = load_state(username=username)
+            if hasattr(state, 'file_mapping') and state.file_mapping:
+                mapped_filename = state.file_mapping.get(file_hash)
+                if mapped_filename:
+                    files[file_hash]["filename"] = mapped_filename
+        
+        # Add chunk to file
+        files[file_hash]["chunks"][chunk_id] = perf
+        
+        # Aggregate file-level stats
+        files[file_hash]["total_attempts"] += perf.get("attempts", 0)
+        files[file_hash]["total_correct"] += perf.get("correct", 0)
+        files[file_hash]["total_incorrect"] += perf.get("incorrect", 0)
+        if perf.get("attempts", 0) > 0:
+            files[file_hash]["chunks_with_data"] += 1
+    
+    # Calculate file-level accuracy
+    for file_hash, file_data in files.items():
+        total_attempts = file_data["total_attempts"]
+        total_correct = file_data["total_correct"]
+        file_data["accuracy"] = (total_correct / total_attempts * 100) if total_attempts > 0 else 0.0
+        
+        # Get most recent attempt across all chunks
+        last_attempts = [p.get("last_attempt") for p in file_data["chunks"].values() if p.get("last_attempt")]
+        if last_attempts:
+            file_data["last_attempt"] = max(last_attempts)
+        else:
+            file_data["last_attempt"] = None
+    
+    return files
 
 
 def get_weak_areas(threshold: float = 60.0, min_attempts: int = 2, username: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -276,4 +468,75 @@ def extract_chunk_id_from_reference(source_reference: str, filename: Optional[st
     
     # Fallback: use first 50 chars as identifier
     return source_reference[:50].replace(" ", "_").lower()
+
+
+def format_topic_name(source_reference: str, max_length: int = 60) -> str:
+    """
+    Extract a user-friendly topic name from a source reference string.
+    Removes technical jargon and extracts meaningful content.
+    
+    Args:
+        source_reference: Raw source reference like "Chunk 1 - EXACT quote: 'AWS offers...'"
+        max_length: Maximum length of the formatted topic name
+        
+    Returns:
+        Clean, user-friendly topic name (e.g., "AWS Foundational Services")
+    """
+    import re
+    
+    if not source_reference:
+        return "Unknown Topic"
+    
+    # Remove common technical prefixes
+    text = source_reference
+    
+    # Remove "EXACT quote:" or "quote:" patterns
+    text = re.sub(r'[Ee]XACT\s+quote\s*:', '', text)
+    text = re.sub(r'quote\s*:', '', text)
+    
+    # Remove "Chunk X -" pattern but keep the number for reference
+    chunk_match = re.search(r'[Cc]hunk\s*(\d+)', text)
+    chunk_num = chunk_match.group(1) if chunk_match else None
+    text = re.sub(r'[Cc]hunk\s*\d+\s*-\s*', '', text)
+    
+    # Extract content from quotes if present
+    quote_match = re.search(r"['\"]([^'\"]{10,})['\"]", text)
+    if quote_match:
+        text = quote_match.group(1)
+    
+    # Clean up the text
+    text = text.strip()
+    
+    # Remove leading/trailing punctuation
+    text = re.sub(r'^[^\w]+|[^\w]+$', '', text)
+    
+    # Capitalize first letter of each word if it's all lowercase
+    words = text.split()
+    if words and all(w.islower() or not w.isalpha() for w in words[:3]):
+        # Capitalize first word
+        if words:
+            words[0] = words[0].capitalize()
+    
+    # Join and truncate
+    result = ' '.join(words)
+    
+    # If we have a chunk number, prepend it for context
+    if chunk_num and len(result) < max_length - 10:
+        result = f"Section {chunk_num}: {result}"
+    
+    # Truncate if too long, but try to break at word boundary
+    if len(result) > max_length:
+        truncated = result[:max_length].rsplit(' ', 1)[0]
+        if len(truncated) > max_length * 0.7:  # Only truncate if we keep most of it
+            result = truncated + "..."
+        else:
+            result = result[:max_length] + "..."
+    
+    # Fallback if result is empty or too short
+    if not result or len(result.strip()) < 5:
+        if chunk_num:
+            return f"Section {chunk_num}"
+        return "Content Area"
+    
+    return result
 
