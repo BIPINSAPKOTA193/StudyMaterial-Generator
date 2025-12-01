@@ -405,7 +405,7 @@ def render_interactive_content(data: Dict[str, Any]):
     # Title with stars display
     col_title, col_stars = st.columns([3, 1])
     with col_title:
-    st.markdown(f"# 🎯 {title}")
+        st.markdown(f"# 🎯 {title}")
     with col_stars:
         stars_display = "⭐" * min(5, st.session_state.interactive_stars)
         st.markdown(f"""
@@ -850,9 +850,9 @@ def main():
                                     generate_mixed_bundle()
                                 else:
                                     # For specific preferences, use that mode
-                            generate_content_for_mode(preference)
-                        else:
-                            generate_mixed_bundle()
+                                    generate_content_for_mode(preference)
+                            else:
+                                generate_mixed_bundle()
                     else:
                         st.error(f"Error: {extract_result.get('error')}")
                     
@@ -877,7 +877,7 @@ def main():
         st.markdown("---")
         if st.button("📊 View Analytics Dashboard", use_container_width=True):
             st.session_state.show_analytics = True
-                st.rerun()
+            st.rerun()
         
         # Show logs
         with st.expander("📋 View Logs"):
