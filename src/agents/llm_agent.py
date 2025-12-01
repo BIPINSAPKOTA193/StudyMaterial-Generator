@@ -659,6 +659,17 @@ Always return valid JSON. NEVER hallucinate or add external knowledge. Better to
     
     def generate_mixed_bundle(self, request: GenerationRequest) -> GenerationResponse:
         """Generate all three content types for mixed bundle"""
+        # Validate chunks first
+        chunks = request.chunks or []
+        if not chunks or all(not chunk.strip() for chunk in chunks):
+            self.logger.error("No valid chunks provided for mixed bundle generation")
+            return GenerationResponse(
+                content_type=ContentType.MIXED,
+                data={},
+                success=False,
+                error="No content chunks available. Please ensure the PDF was properly extracted."
+            )
+        
         # For mixed bundle, we need to extract feedback context for each type
         # If feedback_context is provided and has a general context, use it
         # Otherwise, each type will use its own feedback history (handled in orchestrator)
@@ -745,10 +756,21 @@ Always return valid JSON. NEVER hallucinate or add external knowledge. Better to
             f"interactive={'✓' if (interactive_response.success and interactive_response.data) else '✗'}"
         )
         
+        # Build detailed error message
+        errors = []
+        if not (quiz_response.success and quiz_response.data):
+            errors.append(f"Quiz: {quiz_response.error or 'Failed to generate'}")
+        if not (flashcard_response.success and flashcard_response.data):
+            errors.append(f"Flashcards: {flashcard_response.error or 'Failed to generate'}")
+        if not (interactive_response.success and interactive_response.data):
+            errors.append(f"Interactive: {interactive_response.error or 'Failed to generate'}")
+        
+        error_msg = None if success else f"Failed to generate: {', '.join(errors)}"
+        
         return GenerationResponse(
             content_type=ContentType.MIXED,
             data=data,
             success=success,
-            error=None if success else "Some content types failed to generate"
+            error=error_msg
         )
 

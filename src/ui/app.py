@@ -912,19 +912,19 @@ def main():
                 st.rerun()
             return
         
-        # Verify state file exists and can be loaded
-        from src.core.memory import get_state_path
-        state_path = get_state_path(username)
-        if not state_path.exists():
-            st.warning(f"⚠️ No state file found for user '{username}'. Your analytics data will appear once you start answering questions.")
-        else:
-            # Try to load state to verify it's accessible
-            try:
-                test_state = load_state(username)
-                if not hasattr(test_state, 'chunk_performance') or not test_state.chunk_performance:
-                    st.info("ℹ️ No analytics data recorded yet. Start answering questions to see your progress!")
-            except Exception as e:
-                st.error(f"❌ Error loading state: {e}")
+        # Try to load state (checks Supabase first, then fallback)
+        try:
+            test_state = load_state(username)
+            if not hasattr(test_state, 'chunk_performance') or not test_state.chunk_performance:
+                st.info("ℹ️ No analytics data recorded yet. Start answering questions to see your progress!")
+        except Exception as e:
+            # Check if it's a Supabase connection issue
+            from src.core.supabase_client import get_supabase_client
+            client = get_supabase_client()
+            if client is None:
+                st.warning("⚠️ Supabase connection not configured. Analytics data will be stored locally.")
+            else:
+                st.warning(f"⚠️ Could not load analytics data. Error: {e}")
         
         summary = get_performance_summary(username)
         
